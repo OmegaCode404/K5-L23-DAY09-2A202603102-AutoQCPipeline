@@ -40,5 +40,125 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    settings = cfg["second_opinion"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    issues = []
+
+    for image in ds.image_files():
+        stem = image.stem
+        if stem not in preds:
+            continue
+        if ds.label_path(stem).is_file() is False:
+            continue
+
+        labels = ds.valid_boxes(stem)
+        if not labels:
+            labels = []
+
+        size = ds.image_size(stem)
+        primary_preds = []
+        fp_preds = []
+
+        for row in preds.get(stem, []):
+            try:
+                class_id, conf, cx, cy, width, height = row
+                class_id = int(class_id)
+                conf = float(conf)
+                box = (float(cx), float(cy), float(width), float(height))
+            except (TypeError, ValueError):
+                continue
+
+            if conf >= settings["fp_conf"]:
+                fp_preds.append((box, conf))
+
+            if conf < settings["conf"]:
+                continue
+            if size is None:
+                continue
+
+            image_width, image_height = size
+            area_px = box[2] * image_width * box[3] * image_height
+            if area_px >= settings["min_area_px"]:
+                primary_preds.append((class_id, box, conf))
+
+        for class_id, box, conf in primary_preds:
+            candidates = [
+                (label_class, (label_cx, label_cy, label_w, label_h))
+                for label_class, label_cx, label_cy, label_w, label_h in labels
+            ]
+            cands_with_iou = [
+                (label_class, label_box, iou_xywh(box, label_box))
+                for label_class, label_box in candidates
+            ]
+            cands = [
+                (label_class, label_box, iou)
+                for label_class, label_box, iou in cands_with_iou
+                if iou >= settings["iou_missing"]
+            ]
+
+            if not cands:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                    "model lớn hơn thấy vật có thể chưa có nhãn",
+                    extra={"conf": conf},
+                ))
+                continue
+
+            same_class = [
+                item for item in cands
+                if item[0] == class_id
+            ]
+            if same_class:
+                best_iou = max(item[2] for item in same_class)
+                if best_iou < settings["iou_loose"]:
+                    issues.append(Issue(
+                        "second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                        "nhãn cùng lớp có thể bị lệch hoặc box quá lỏng",
+                        extra={"iou": best_iou},
+                    ))
+                continue
+
+            other_class = [
+                item for item in cands
+                if item[0] != class_id
+            ]
+            if other_class:
+                best_iou = max(item[2] for item in other_class)
+                if best_iou >= settings["iou_match"]:
+                    issues.append(Issue(
+                        "second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                        "vị trí trùng vật có thể bị gán sai lớp",
+                        extra={"iou": best_iou},
+                    ))
+
+        for line_no, text in ds.read_label_lines(stem) or []:
+            try:
+                label = parse_yolo_line(text)
+            except ValueError:
+                continue
+
+            label_class, cx, cy, width, height = label
+            if not 0 <= label_class < len(ds.classes):
+                continue
+
+            label_box = (cx, cy, width, height)
+            max_iou = 0.0
+            matched = False
+            for pred_box, _ in fp_preds:
+                iou = iou_xywh(label_box, pred_box)
+                max_iou = max(max_iou, iou)
+                if iou >= settings["iou_missing"]:
+                    matched = True
+                    break
+
+            if not matched:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                    "box nhãn có thể thừa so với dự đoán của model lớn hơn",
+                    line=line_no,
+                    extra={"iou": max_iou},
+                ))
+
+    return issues
